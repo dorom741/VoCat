@@ -939,6 +939,27 @@ func (manager *Manager) ExecuteAT(
 	return response, err
 }
 
+// SupportsCLCC reports whether the firmware behind a device implements the
+// 3GPP call-list query. Pollers use it to skip firmware that answers with
+// "command not recognized" instead of burning a control-channel round trip
+// every cycle. Unknown devices report true so their presence handling stays
+// with the caller, and every device without an identity profile override
+// keeps the historical polling behavior.
+func (manager *Manager) SupportsCLCC(id string) bool {
+	manager.mu.RLock()
+	state := manager.devices[id]
+	manager.mu.RUnlock()
+	if state == nil {
+		return true
+	}
+	state.opMu.Lock()
+	defer state.opMu.Unlock()
+	if state.atProfile.Identity == nil {
+		return true
+	}
+	return state.atProfile.Identity.SupportsCLCC()
+}
+
 // ExecuteSensitiveAT runs an AT command whose payload contains short-lived
 // authentication material. The original transport error is returned to the
 // caller, but it is never retained in the device snapshot because a

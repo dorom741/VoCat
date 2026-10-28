@@ -36,6 +36,14 @@ func (s *Server) handleCalls(w http.ResponseWriter, r *http.Request, config stor
 		}})
 		return true
 	}
+	// Firmware without a call-list implementation answers AT+CLCC with a
+	// vendor "command not recognized" error. Surface an explicit capability
+	// answer instead of spending a control-channel round trip per request.
+	if !s.supportsCLCC(physicalID) {
+		writeError(w, http.StatusNotImplemented, "clcc_unsupported",
+			"this modem firmware does not implement the call list query (AT+CLCC)")
+		return true
+	}
 	response, err := s.devices.ExecuteAT(r.Context(), physicalID, "AT+CLCC")
 	if err != nil {
 		s.writeDeviceError(w, err)
@@ -213,6 +221,17 @@ func (s *Server) hangupVoWiFiAfter(deviceID, callID string, duration time.Durati
 	if err := controller.HangupCall(ctx, deviceID, callID); err != nil {
 		s.logger.Warn("automatic VoWiFi call hangup failed", "device_id", deviceID, "call_id", callID, "error", err)
 	}
+}
+
+// supportsCLCC reports whether the device firmware implements AT+CLCC.
+// Managers that resolve the chipset profile answer from it; controllers
+// without the capability (tests, SIM readers) keep the historical polling
+// behavior for every device.
+func (s *Server) supportsCLCC(deviceID string) bool {
+	if capability, ok := s.devices.(interface{ SupportsCLCC(string) bool }); ok {
+		return capability.SupportsCLCC(deviceID)
+	}
+	return true
 }
 
 func (s *Server) callTransport(deviceID string) string {

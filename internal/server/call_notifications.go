@@ -327,6 +327,12 @@ func (s *Server) pollCellularCalls(ctx context.Context) {
 		if !present {
 			continue
 		}
+		if !s.supportsCLCC(physicalID) {
+			// The firmware has no call-list implementation; polling would
+			// burn a control-channel round trip every cycle. Call state only
+			// arrives through the modem's own notifications.
+			continue
+		}
 		pollCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		response, err := s.devices.ExecuteAT(pollCtx, physicalID, "AT+CLCC")
 		cancel()

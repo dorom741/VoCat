@@ -1770,6 +1770,9 @@ func (bot *telegramBot) executeTimedCellularCall(
 }
 
 func (bot *telegramBot) telegramCellularCalls(ctx context.Context, physicalID string) ([]map[string]any, error) {
+	if !bot.server.supportsCLCC(physicalID) {
+		return nil, errors.New("该模块固件不支持 AT+CLCC 查询")
+	}
 	queryContext, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	response, err := bot.server.devices.ExecuteAT(queryContext, physicalID, "AT+CLCC")
