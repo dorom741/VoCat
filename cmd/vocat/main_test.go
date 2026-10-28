@@ -237,6 +237,17 @@ func TestProvisionedDeviceTypeRecognizesNativeWWAN(t *testing.T) {
 	if got := provisionedDeviceType(usb); got != store.DeviceTypePCIeEC20EC25 {
 		t.Fatalf("USB modem type = %q, want %q", got, store.DeviceTypePCIeEC20EC25)
 	}
+
+	// The ZXIC family is provisioned by chipset, not product: an unlisted
+	// product ID of the same vendor must still get the dedicated type so
+	// the VoWiFi adapter dispatch selects the ZXIC dialect.
+	zxic := modem.Candidate{
+		VendorID: "19d2", ProductID: "ffff",
+		ATPort: modem.Port{Path: "/dev/ttyUSB2"},
+	}
+	if got := provisionedDeviceType(zxic); got != store.DeviceTypeZXIC {
+		t.Fatalf("ZXIC family type = %q, want %q", got, store.DeviceTypeZXIC)
+	}
 }
 
 func TestProvisionDiscoveredDevicesSkipsIssueAndNoAT(t *testing.T) {

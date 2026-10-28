@@ -28,6 +28,29 @@ func TestFillConfigFromPhysicalClassifiesDJI4G(t *testing.T) {
 	}
 }
 
+// TestFillConfigFromPhysicalClassifiesZXIC pins the discovered-device
+// marking for the ZXIC chipset family: both the discovered listing and the
+// takeover reclassification must stamp the dedicated zxic type so the UI
+// can identify the chip through the whole configuration flow. The product
+// used here is an unlisted family ID: classification must not depend on the
+// one product that happened to be tested first.
+func TestFillConfigFromPhysicalClassifiesZXIC(t *testing.T) {
+	config := store.Device{DeviceType: store.DeviceTypePCIeEC20EC25}
+	entry := device.Device{Candidate: modem.Candidate{
+		VendorID:  "19d2",
+		ProductID: "ffff",
+	}}
+
+	fillConfigFromPhysical(&config, entry)
+
+	if config.DeviceType != store.DeviceTypeZXIC {
+		t.Fatalf("device type = %q, want %q", config.DeviceType, store.DeviceTypeZXIC)
+	}
+	if got := discoveredDeviceType(entry.Candidate); got != store.DeviceTypeZXIC {
+		t.Fatalf("discovered device type = %q, want %q", got, store.DeviceTypeZXIC)
+	}
+}
+
 func TestConfiguredDeviceSummaryIgnoresVoWiFiRuntimeFromPreviousSIM(t *testing.T) {
 	database, err := store.Open(context.Background(), ":memory:")
 	if err != nil {
