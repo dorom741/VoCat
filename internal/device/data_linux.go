@@ -254,7 +254,14 @@ func (manager *Manager) NetworkStatus(ctx context.Context, id string) (NetworkSt
 	// The AT backend reports the live host lease (DHCP process, address and
 	// protected routes are applied together by the session). Both the periodic
 	// monitor and the HTTP status API share this path.
-	if state.dataBackend == "at" || state.atHostSession != nil {
+	//
+	// An AT-only device (no QMI control point, or no host interface) stays on
+	// this branch even when a failed recovery cleared the session. Falling
+	// through to QMI would return ErrDataBackendUnavailable, which the data
+	// monitor skips, so the device would never retry. Reporting a
+	// disconnected AT session instead lets the existing watchdog recover it.
+	if state.dataBackend == "at" || state.atHostSession != nil ||
+		candidate.QMIControl == "" || candidate.NetworkInterface == "" {
 		status := NetworkStatus{Backend: "at", Interface: candidate.NetworkInterface}
 		session := state.atHostSession
 		if session == nil {
@@ -438,7 +445,7 @@ func qmiDataHostReady(ctx context.Context, networkInterface string) error {
 	if !hasIPv4 {
 		return errors.New("cellular interface has no IPv4 address")
 	}
-	ipCommand, err := exec.LookPath("ip")
+	ipCommand, err := lookPathIP("ip")
 	if err != nil {
 		return fmt.Errorf("check cellular policy route: %w", err)
 	}
@@ -576,7 +583,7 @@ func (manager *Manager) setQMINetwork(
 	password string,
 	authentication string,
 ) (NetworkResult, error) {
-	ipCommand, err := exec.LookPath("ip")
+	ipCommand, err := lookPathIP("ip")
 	if err != nil {
 		return NetworkResult{}, fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, candidate.NetworkInterface)
 	}
@@ -745,6 +752,11 @@ var hostCommandOutput = func(ctx context.Context, name string, args ...string) (
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
+// lookPathIP resolves the iproute2 binary. It is a variable so tests can
+// stub the lookup: the recorded command stream must not depend on where
+// iproute2 happens to be installed on the test host.
+var lookPathIP = exec.LookPath
+
 func configureExportProxyDHCP(ctx context.Context, busybox, ipCommand, networkInterface string) (string, error) {
 	lease, err := os.CreateTemp("", "vocat-dhcp-lease-*.env")
 	if err != nil {
@@ -833,8 +845,12 @@ func configureExportProxyIPv4(ctx context.Context, ipCommand, networkInterface, 
 		return "", fmt.Errorf("configure cellular address: %w: %s", addrErr, strings.TrimSpace(string(result)))
 	}
 	mark, table, priority := exportProxyRouteIdentity(networkInterface)
-	clearExportProxyRoute(ctx, networkInterface)
 	connectedCIDR := fmt.Sprintf("%s/%d", network.String(), prefix)
+	// The protected table is refreshed before the policy rule is touched, so
+	// the rule keeps matching a populated table for the whole renewal. The
+	// previous generation is read first: a lease that changed its prefix
+	// leaves its connected route behind otherwise.
+	previousCIDRs := exportProxyTableCIDRs(ctx, ipCommand, table)
 	if result, routeErr := hostCommandOutput(ctx, ipCommand, "-4", "route", "replace", "table", strconv.Itoa(table), connectedCIDR, "dev", networkInterface, "scope", "link", "src", address.String()); routeErr != nil {
 		clearExportProxyRoute(ctx, networkInterface)
 		return "", fmt.Errorf("install protected connected route: %w: %s", routeErr, strings.TrimSpace(string(result)))
@@ -848,17 +864,47 @@ func configureExportProxyIPv4(ctx context.Context, ipCommand, networkInterface, 
 		clearExportProxyRoute(ctx, networkInterface)
 		return "", fmt.Errorf("install protected default route: %w: %s", routeErr, strings.TrimSpace(string(result)))
 	}
-	markText := fmt.Sprintf("0x%x", mark)
-	result, err := hostCommandOutput(ctx, ipCommand, "rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table))
-	if err != nil {
+	for _, previous := range previousCIDRs {
+		if previous == connectedCIDR {
+			continue
+		}
+		_, _ = hostCommandOutput(ctx, ipCommand, "-4", "route", "del", "table", strconv.Itoa(table), previous)
+	}
+	if err := ensureExportProxyRule(ctx, ipCommand, priority, mark, table); err != nil {
 		clearExportProxyRoute(ctx, networkInterface)
-		return "", fmt.Errorf("install protected routing rule: %w: %s", err, strings.TrimSpace(string(result)))
+		return "", err
 	}
 	if err := writeExportProxyDNS(networkInterface, dns); err != nil {
 		clearExportProxyRoute(ctx, networkInterface)
 		return "", fmt.Errorf("publish protected DNS configuration: %w", err)
 	}
 	return fmt.Sprintf("protected IPv4 configuration %s/%d", address.String(), prefix), nil
+}
+
+// exportProxyTableCIDRs lists the connected networks in the protected
+// routing table. It is used to drop the previous generation's connected
+// route when a renewal changed the prefix.
+func exportProxyTableCIDRs(ctx context.Context, ipCommand string, table int) []string {
+	output, err := hostCommandOutput(ctx, ipCommand, "-4", "route", "show", "table", strconv.Itoa(table))
+	if err != nil {
+		return nil
+	}
+	var cidrs []string
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		candidate := fields[0]
+		if !strings.Contains(candidate, "/") {
+			continue
+		}
+		if _, _, parseErr := net.ParseCIDR(candidate); parseErr != nil {
+			continue
+		}
+		cidrs = append(cidrs, candidate)
+	}
+	return cidrs
 }
 
 // exportProxyDNSDir is the directory holding per-interface protected DNS
@@ -913,13 +959,77 @@ func writeExportProxyDNS(networkInterface string, servers []string) error {
 
 func clearExportProxyRoute(ctx context.Context, networkInterface string) {
 	_ = os.Remove(exportProxyDNSPath(networkInterface))
-	ipCommand, err := exec.LookPath("ip")
+	ipCommand, err := lookPathIP("ip")
 	if err != nil {
 		return
 	}
 	mark, table, priority := exportProxyRouteIdentity(networkInterface)
 	_, _ = hostCommandOutput(ctx, ipCommand, "rule", "del", "priority", strconv.Itoa(priority), "fwmark", fmt.Sprintf("0x%x", mark), "lookup", strconv.Itoa(table))
 	_, _ = hostCommandOutput(ctx, ipCommand, "-4", "route", "flush", "table", strconv.Itoa(table))
+}
+
+// ensureExportProxyRule installs the fwmark policy rule unless an identical
+// rule is already in place. The mark, table and priority are derived from
+// the interface name and stay stable, so a renewal must not delete and
+// re-add the rule: the gap in between would drop the marked traffic out of
+// the protected table.
+func ensureExportProxyRule(ctx context.Context, ipCommand string, priority int, mark uint32, table int) error {
+	markText := fmt.Sprintf("0x%x", mark)
+	rules, err := hostCommandOutput(ctx, ipCommand, "rule", "show")
+	if err == nil {
+		listed := string(rules)
+		if exportProxyRuleMatches(listed, priority, markText, table) {
+			return nil
+		}
+		if exportProxyRulePriorityUsed(listed, priority) {
+			// A rule with the same priority carries a stale mark or table.
+			// The protected table is already populated at this point, so
+			// replacing the rule keeps the marked traffic inside it.
+			_, _ = hostCommandOutput(ctx, ipCommand, "rule", "del", "priority", strconv.Itoa(priority))
+		}
+	}
+	result, err := hostCommandOutput(ctx, ipCommand, "rule", "add", "priority", strconv.Itoa(priority), "fwmark", markText, "lookup", strconv.Itoa(table))
+	if err != nil {
+		return fmt.Errorf("install protected routing rule: %w: %s", err, strings.TrimSpace(string(result)))
+	}
+	return nil
+}
+
+// exportProxyRuleMatches reports whether the listed ip rules already carry
+// the expected fwmark rule for the given priority.
+func exportProxyRuleMatches(listed string, priority int, markText string, table int) bool {
+	for _, line := range strings.Split(listed, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasSuffix(fields[0], ":") {
+			continue
+		}
+		rulePriority, err := strconv.Atoi(strings.TrimSuffix(fields[0], ":"))
+		if err != nil || rulePriority != priority {
+			continue
+		}
+		joined := strings.Join(fields, " ")
+		if strings.Contains(joined, "fwmark "+markText) &&
+			strings.Contains(joined, "lookup "+strconv.Itoa(table)) {
+			return true
+		}
+	}
+	return false
+}
+
+// exportProxyRulePriorityUsed reports whether any rule already owns the
+// priority, which would make ip rule add fail.
+func exportProxyRulePriorityUsed(listed string, priority int) bool {
+	for _, line := range strings.Split(listed, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasSuffix(fields[0], ":") {
+			continue
+		}
+		rulePriority, err := strconv.Atoi(strings.TrimSuffix(fields[0], ":"))
+		if err == nil && rulePriority == priority {
+			return true
+		}
+	}
+	return false
 }
 
 const managerCommandCleanupTimeout = 15 * time.Second

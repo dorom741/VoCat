@@ -108,11 +108,11 @@ func (profile markerPDPProfile) ActivateCommand(cid int, enabled bool) string {
 // modem with an ECM host network interface and no QMI control point.
 func testATDataCandidate() modem.Candidate {
 	return modem.Candidate{
-		ID:           "zxic-test-uz901",
-		VendorID:     "19d2",
-		ProductID:    "0536",
-		Manufacturer: "ALK,Incorporated",
-		Product:      "ALK Mobile Boardband",
+		ID:               "zxic-test-uz901",
+		VendorID:         "19d2",
+		ProductID:        "0536",
+		Manufacturer:     "ALK,Incorporated",
+		Product:          "ALK Mobile Boardband",
 		NetworkInterface: "enx344b50000000",
 		ATPort: modem.Port{
 			Path:            "/dev/ttyUSB0",
@@ -154,7 +154,7 @@ func newStartedATDataTestManager(
 	id := candidate.ID
 	opener := &staticOpener{client: client}
 	manager, err := NewManager(Options{
-		Discoverer: staticDiscoverer{candidates: []modem.Candidate{candidate}},
+		Discoverer:     staticDiscoverer{candidates: []modem.Candidate{candidate}},
 		Opener:         opener,
 		CommandTimeout: time.Second,
 		LongTimeout:    time.Second,
@@ -304,6 +304,83 @@ func TestSetNetworkATRejectsMissingInterface(t *testing.T) {
 		t.Fatalf("host link starts = %v, want none", started)
 	}
 	client.assertDone(t)
+}
+
+// A device that lost its host interface must still be able to deactivate its
+// PDP context: the interface and the platform link are only required to
+// bring the data path up, so the disable path may not demand them.
+func TestSetNetworkATDisableDoesNotRequireHostInterface(t *testing.T) {
+	client := &transcriptClient{steps: []clientStep{
+		{command: "AT+CGACT=0,1", response: okResponse()},
+	}}
+	link := &fakeATHostLink{}
+	manager, id := newStartedATDataTestManager(t, client, link)
+	state, err := manager.lookup(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.candidate.NetworkInterface = ""
+
+	result, err := manager.SetNetwork(context.Background(), id, NetworkRequest{Enabled: false})
+	if err != nil {
+		t.Fatalf("SetNetwork disable without a host interface: %v", err)
+	}
+	if result.Enabled {
+		t.Fatal("SetNetwork disable reports enabled")
+	}
+	if result.Backend != "at" {
+		t.Fatalf("disable backend = %q, want %q", result.Backend, "at")
+	}
+	client.assertDone(t)
+}
+
+// A recovery re-enable must not leave the previous DHCP process and its
+// protected routes alive alongside the new lease: the old session would
+// keep its udhcpc running, and its later deconfig would flush the
+// per-interface table the new lease shares.
+func TestSetNetworkATEnableClosesPreviousHostSession(t *testing.T) {
+	client := &transcriptClient{steps: []clientStep{
+		{command: "AT+CGACT?", response: okResponse("+CGACT: 1,0")},
+		{command: `AT+CGDCONT=1,"IPV4V6","internet"`, response: okResponse()},
+		{command: "AT+CGATT=1", response: okResponse()},
+		{command: "AT+CGACT=1,1", response: okResponse()},
+		// The first enable activated context 1, so the recovery probe finds
+		// it active and has to deactivate it before reconfiguring.
+		{command: "AT+CGACT?", response: okResponse("+CGACT: 1,1")},
+		{command: "AT+CGACT=0,1", response: okResponse()},
+		{command: `AT+CGDCONT=1,"IPV4V6","internet"`, response: okResponse()},
+		{command: "AT+CGATT=1", response: okResponse()},
+		{command: "AT+CGACT=1,1", response: okResponse()},
+	}}
+	link := &fakeATHostLink{}
+	manager, id := newStartedATDataTestManager(t, client, link)
+
+	// The first enable leaves a live host session behind.
+	if _, err := manager.SetNetwork(context.Background(), id, NetworkRequest{
+		Enabled: true, APN: "internet", IPVersion: "IPV4V6",
+	}); err != nil {
+		t.Fatalf("first enable: %v", err)
+	}
+	first := link.lastSession()
+	if first == nil {
+		t.Fatal("first enable started no host session")
+	}
+	if first.isClosed() {
+		t.Fatal("first host session is closed right after the enable")
+	}
+
+	// The recovery re-enable must tear the old session down first.
+	if _, err := manager.SetNetwork(context.Background(), id, NetworkRequest{
+		Enabled: true, APN: "internet", IPVersion: "IPV4V6",
+	}); err != nil {
+		t.Fatalf("recovery enable: %v", err)
+	}
+	if !first.isClosed() {
+		t.Fatal("recovery enable left the previous host session open")
+	}
+	if started := link.startedInterfaces(); len(started) != 2 {
+		t.Fatalf("host link starts = %v, want two", started)
+	}
 }
 
 func TestSetNetworkATUsesResolvedPDPProfile(t *testing.T) {

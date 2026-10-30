@@ -4,6 +4,7 @@ package device
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,12 @@ const (
 	atHostFirstLeaseTimeout = 60 * time.Second
 	atHostConfigureTimeout  = 15 * time.Second
 	atHostStopTimeout       = 10 * time.Second
+
+	// atHostEventPollInterval is how often the non-blocking FIFO reader wakes
+	// to re-check the session context while the DHCP hook is idle. It only
+	// bounds shutdown latency, not event delivery: a hook write wakes the
+	// next read immediately.
+	atHostEventPollInterval = 50 * time.Millisecond
 )
 
 func newATHostDataLink() atHostDataLink {
@@ -42,7 +49,7 @@ func (link *linuxATHostDataLink) Start(ctx context.Context, networkInterface str
 	if networkInterface == "" {
 		return nil, fmt.Errorf("%w: a network interface is required", ErrDataBackendUnavailable)
 	}
-	ipCommand, err := exec.LookPath("ip")
+	ipCommand, err := lookPathIP("ip")
 	if err != nil {
 		return nil, fmt.Errorf("%w: install iproute2 to control %s", ErrDataBackendUnavailable, networkInterface)
 	}
@@ -112,10 +119,30 @@ exit 0
 	session.wg.Add(1)
 	go session.watchProcess()
 
-	if err := session.waitFirstLease(ctx); err != nil {
+	if err := session.awaitFirstLease(ctx); err != nil {
 		return nil, err
 	}
 	return session, nil
+}
+
+// awaitFirstLease waits for the first DHCP lease within the lease timeout and
+// closes the session on every failure path.
+//
+// udhcpc without -n retries discovery indefinitely, so a carrier that never
+// answers DHCP would block Start forever while the caller holds the device
+// operation lock. The bound therefore lives here rather than in the
+// caller's context, which may carry no deadline at all.
+func (session *linuxATHostDataSession) awaitFirstLease(ctx context.Context) error {
+	leaseContext, cancelLease := context.WithTimeout(ctx, atHostFirstLeaseTimeout)
+	defer cancelLease()
+	if err := session.waitFirstLease(leaseContext); err != nil {
+		// Close on every failure path, not only the cancellation branch: a
+		// lost lease or an exited DHCP process must not leave the process
+		// and its temp directory behind.
+		_ = session.Close(context.Background())
+		return err
+	}
+	return nil
 }
 
 type atHostProcess interface {
@@ -169,6 +196,10 @@ func startForegroundUDHCPC(
 	if err == nil {
 		command.Stdout = logFile
 		command.Stderr = logFile
+		// exec.Cmd.Wait does not close a file the caller supplied, and the
+		// child keeps its own copy of the descriptor. Closing it here keeps
+		// a long-running daemon from collecting one descriptor per session.
+		defer func() { _ = logFile.Close() }()
 	}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start udhcpc on %s: %w", networkInterface, err)
@@ -193,6 +224,13 @@ type linuxATHostDataSession struct {
 	eventPath        string
 	background       context.Context
 	cancel           context.CancelFunc
+
+	// eventMu serializes lease-event application against the process-exit
+	// cleanup. Without it, a delayed bound event could finish after
+	// watchProcess tore the routes and lease down, resurrecting a session
+	// whose DHCP process has already exited.
+	eventMu       sync.Mutex
+	eventsStopped bool
 
 	mu         sync.Mutex
 	lease      *atDHCPLease
@@ -234,6 +272,9 @@ func (session *linuxATHostDataSession) Close(ctx context.Context) error {
 	session.closed = true
 	session.mu.Unlock()
 
+	// Stop accepting lease events before tearing anything down, so an event
+	// that is already buffered cannot reinstall the routes Close removes.
+	session.stopLeaseEvents()
 	if session.cancel != nil {
 		session.cancel()
 	}
@@ -242,14 +283,8 @@ func (session *linuxATHostDataSession) Close(ctx context.Context) error {
 		_ = session.process.Stop(stopCtx)
 		cancelStop()
 	}
-	// Unblock a FIFO reader parked in open(2) by completing one writer
-	// handshake, then let the loop observe the cancelled context.
-	if session.eventPath != "" {
-		if writer, err := os.OpenFile(session.eventPath, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
-			_, _ = writer.Write([]byte("\n\n"))
-			_ = writer.Close()
-		}
-	}
+	// The reader opens the FIFO read-write and non-blocking, so it is never
+	// parked in open(2); the cancelled context ends its poll loop.
 	session.wg.Wait()
 
 	cleanupContext := ctx
@@ -276,29 +311,98 @@ func (session *linuxATHostDataSession) cleanupHost(ctx context.Context) {
 	_, _ = session.runner(ctx, session.ipCommand, "link", "set", "dev", session.networkInterface, "down")
 }
 
+// readEvents drains the DHCP hook records from the event FIFO.
+//
+// The FIFO is opened read-write and non-blocking so shutdown can never park in
+// open(2): a reader that lost the race against the DHCP writer used to block
+// forever, and Close then hung in wg.Wait() while holding the device
+// operation lock. Read-write keeps the FIFO from ever reporting EOF, and the
+// EAGAIN poll loop observes the session context between attempts.
 func (session *linuxATHostDataSession) readEvents() {
 	defer session.wg.Done()
+	background := session.background
+	if background == nil {
+		background = context.Background()
+	}
+	fd, err := syscall.Open(session.eventPath, syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return
+	}
+	defer func() { _ = syscall.Close(fd) }()
+
+	buffer := make([]byte, 4096)
+	var pending []byte
+	values := make(map[string]string)
 	for {
-		if session.background.Err() != nil {
+		if background.Err() != nil {
 			return
 		}
-		file, err := os.OpenFile(session.eventPath, os.O_RDONLY, 0)
-		if err != nil {
+		read, readErr := syscall.Read(fd, buffer)
+		if read > 0 {
+			pending = append(pending, buffer[:read]...)
+			for {
+				index := bytes.IndexByte(pending, '\n')
+				if index < 0 {
+					break
+				}
+				line := strings.TrimSpace(string(pending[:index]))
+				pending = pending[index+1:]
+				if line == "" {
+					// A blank line terminates a hook record.
+					if len(values) > 0 {
+						session.handleLeaseEvent(values)
+						values = make(map[string]string)
+					}
+					continue
+				}
+				if key, value, found := strings.Cut(line, "="); found {
+					values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+				}
+			}
+			continue
+		}
+		if readErr != nil && readErr != syscall.EAGAIN && readErr != syscall.EWOULDBLOCK {
 			return
 		}
-		var lines []string
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			lines = append(lines, scanner.Text())
-		}
-		_ = file.Close()
-		if session.background.Err() != nil {
+		if !session.waitForEventPoll(background) {
 			return
-		}
-		if len(lines) > 0 {
-			session.handleEventLines(strings.NewReader(strings.Join(lines, "\n") + "\n"))
 		}
 	}
+}
+
+// waitForEventPoll sleeps for one poll interval, returning false as soon as
+// the session context is cancelled so the reader can exit.
+func (session *linuxATHostDataSession) waitForEventPoll(background context.Context) bool {
+	timer := time.NewTimer(atHostEventPollInterval)
+	defer timer.Stop()
+	select {
+	case <-background.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// handleLeaseEvent applies a hook record unless the lease events have been
+// stopped. It is the only path from event parsing to the host state, so the
+// stop flag and event application are atomic with respect to each other.
+func (session *linuxATHostDataSession) handleLeaseEvent(values map[string]string) {
+	session.eventMu.Lock()
+	defer session.eventMu.Unlock()
+	if session.eventsStopped {
+		return
+	}
+	session.applyEvent(values)
+}
+
+// stopLeaseEvents permanently disables lease-event application. It is called
+// by Close and by the DHCP process watcher before the process-exit cleanup, so
+// a delayed bound/renew event can never rebuild the routes that cleanup
+// removed.
+func (session *linuxATHostDataSession) stopLeaseEvents() {
+	session.eventMu.Lock()
+	session.eventsStopped = true
+	session.eventMu.Unlock()
 }
 
 func (session *linuxATHostDataSession) watchProcess() {
@@ -306,8 +410,12 @@ func (session *linuxATHostDataSession) watchProcess() {
 	_ = session.process.Wait()
 	// An unexpected DHCP exit (interface down, carrier loss) drops the lease
 	// and the protected routes; Status then reports disconnected so the
-	// monitor can recover.
+	// monitor can recover. Stop lease events first and hold eventMu for the
+	// cleanup, so a bound event racing the exit cannot resurrect the session.
+	session.stopLeaseEvents()
+	session.eventMu.Lock()
 	session.applyEvent(map[string]string{"event": "deconfig"})
+	session.eventMu.Unlock()
 	close(session.done)
 }
 
@@ -320,7 +428,7 @@ func (session *linuxATHostDataSession) handleEventLines(reader io.Reader) {
 		if len(values) == 0 {
 			return
 		}
-		session.applyEvent(values)
+		session.handleLeaseEvent(values)
 		values = make(map[string]string)
 	}
 	for scanner.Scan() {
@@ -371,7 +479,14 @@ func (session *linuxATHostDataSession) applyEvent(values map[string]string) {
 		)
 		cancel()
 		if err != nil {
-			session.setLeaseError(err)
+			// The failed configure already tore down the protected routes
+			// and rule, so the previous lease no longer describes the host
+			// path. Keeping it would let Status report "connected" from a
+			// stale lease and the monitor would never recover the session.
+			session.mu.Lock()
+			session.lease = nil
+			session.lastErr = err
+			session.mu.Unlock()
 			return
 		}
 		session.mu.Lock()

@@ -287,6 +287,14 @@ func (manager *Manager) SetNetwork(
 		if candidate.QMIControl == "" || candidate.NetworkInterface == "" {
 			return NetworkResult{}, fmt.Errorf("%w: QMI control device and network interface are required", ErrDataBackendUnavailable)
 		}
+		// Switching to the QMI backend must tear the AT host session down
+		// first. Both backends own the same host interface: a surviving
+		// udhcpc would keep reapplying its lease, and its later deconfig
+		// would flush the address and routes the QMI session just
+		// installed. The session is closed under dataMu so a concurrent AT
+		// path cannot install a new one afterwards; closeATHostSession
+		// cannot be used here because it takes the same lock.
+		manager.closeATHostSessionLocked(state)
 		// OpenStick's native WWAN path must drive registration through QMI NAS.
 		// AT+COPS only updates the legacy AT facade on this firmware and can leave
 		// NAS in not-registered-searching, which then makes WDS dialing report a
@@ -362,12 +370,6 @@ func (manager *Manager) setATNetwork(
 	authentication string,
 ) (NetworkResult, error) {
 	networkInterface := strings.TrimSpace(candidate.NetworkInterface)
-	if networkInterface == "" {
-		return NetworkResult{}, fmt.Errorf("%w: a host network interface is required for the AT data backend", ErrDataBackendUnavailable)
-	}
-	if manager.atHostDataLink == nil {
-		return NetworkResult{}, ErrDataBackendUnavailable
-	}
 	profile := state.atProfile.PDP
 
 	if !enabled {
@@ -390,11 +392,25 @@ func (manager *Manager) setATNetwork(
 			Detail:    "PDP context deactivated",
 		}, nil
 	}
+	// The host interface and the platform link are only required to bring
+	// the data path up. A device that lost its host interface must still be
+	// able to deactivate its PDP context.
+	if networkInterface == "" {
+		return NetworkResult{}, fmt.Errorf("%w: a host network interface is required for the AT data backend", ErrDataBackendUnavailable)
+	}
+	if manager.atHostDataLink == nil {
+		return NetworkResult{}, ErrDataBackendUnavailable
+	}
 
 	client, err := manager.clientLocked(ctx, state, candidate)
 	if err != nil {
 		return NetworkResult{}, err
 	}
+	// A recovery re-enable must not leave the previous DHCP process and its
+	// protected routes alive alongside the new lease: the old session would
+	// keep its udhcpc running, and its later deconfig would flush the
+	// per-interface table the new lease shares.
+	manager.closeATHostSession(ctx, state)
 
 	// 3GPP forbids reconfiguring an active context, and modems such as the
 	// ZXIC platform auto-activates a default PDN on context 1. Probe the state and
@@ -472,6 +488,20 @@ func (manager *Manager) closeATHostSession(ctx context.Context, state *managedDe
 	state.dataMu.Unlock()
 	if session != nil {
 		_ = session.Close(ctx)
+	}
+}
+
+// closeATHostSessionLocked closes the AT host session while the caller holds
+// state.dataMu. The reference and the backend marker are cleared first, so
+// the session is torn down even when its Close blocks on the host cleanup.
+func (manager *Manager) closeATHostSessionLocked(state *managedDevice) {
+	session := state.atHostSession
+	state.atHostSession = nil
+	if state.dataBackend == "at" {
+		state.dataBackend = ""
+	}
+	if session != nil {
+		_ = session.Close(context.Background())
 	}
 }
 
